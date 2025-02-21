@@ -9,15 +9,22 @@ from openpyxl import load_workbook
 from tempfile import TemporaryDirectory
 from lxml import etree
 
-openai.api_key = ""
+# openai api
+client = openai.OpenAI(api_key="")
 
+# 연결 -> 몽고디비
 MONGO_URI = "mongodb+srv://smocookie:smocookie@cluster0.btwrt.mongodb.net/?retryWrites=true&w=majority"
-client = MongoClient(MONGO_URI)
-db = client["personal_info_db"]
+client_db = MongoClient(MONGO_URI)
+db = client_db["personal_info_db"]
 detected_info_collection = db["detected_info"]
 file_metadata_collection = db["file_metadata"]
 additional_info_collection = db["additional_info"]
 
+MASKED_DIR = "masked_files"
+if not os.path.exists(MASKED_DIR):  
+    os.makedirs(MASKED_DIR)
+
+# 정규표현식
 patterns = {
     "주민등록번호": r"\b\d{6}-\d{7}\b",
     "연락처": r"\b010-\d{4}-\d{4}\b",
@@ -28,22 +35,24 @@ patterns = {
     "카드번호": r"\b\d{4}-\d{4}-\d{4}-\d{4}\b"
 }
 
-
-def detect_pii_with_regex(content):
+# 정규표현식 기반 탐지
+def detect_pii_with_regex(content, selected_types):
     results = {}
     for key, pattern in patterns.items():
-        matches = re.findall(pattern, content)
-        if matches:
-            results[key] = list(set(matches))  # 중복 제거
+        if key in selected_types:
+            matches = re.findall(pattern, content)
+            if matches:
+                results[key] = list(set(matches))  # 중복 제거
     return results
 
-
-def detect_sensitive_info_with_chatgpt(content, additional_info):
+# open ai 기반탐지
+def detect_sensitive_info_with_chatgpt(content, selected_types, additional_info):
     prompt = f"""
-    다음 텍스트에서 개인정보(이름 및 주소)와 추가 요청된 정보를 탐지해주세요:
-    - 개인정보에는 연락처, 이메일, 주민등록번호, 주소, 계좌번호 등 개인을 특정할 수 있는 정보가 포함됩니다.
+    다음 텍스트에서 다음 항목을 문맥을 분석하여 탐지하세요:
+    - 선택된 개인정보: {selected_types}
     - 추가 요청 정보: {additional_info}
-    반환 형식(JSON):
+    
+    **반환 형식(JSON):**
     {{
         "개인정보": {{
             "이름": ["홍길동", "김철수"],
@@ -53,34 +62,28 @@ def detect_sensitive_info_with_chatgpt(content, additional_info):
             "추가 요청 정보": ["Project Alpha", "XYZ Corporation"]
         }}
     }}
-    텍스트:
+
+    **분석할 텍스트:**
     {content}
     """
-    response = openai.ChatCompletion.create(
+
+    response = client.chat.completions.create(
         model="gpt-4",
-        messages=[{"role": "user", "content": prompt}]
+        messages=[{"role": "user", "content": prompt}],
     )
 
     try:
-        return json.loads(response['choices'][0]['message']['content'])
+        return json.loads(response.choices[0].message.content)
     except json.JSONDecodeError:
         return {"error": "Invalid JSON from ChatGPT"}
 
-
-# def save_to_mongodb(file_name, detected_info, additional_results):
-#     document = {
-#         "file_name": file_name,
-#         "detected_info": detected_info,
-#         "chatgpt_plus_results": additional_results
-#     }
-#     collection.insert_one(document)
-
+# 디비에 탐지된 정보 저장
 def save_to_mongodb(file_name, detected_info, additional_results):
     file_metadata_collection.insert_one({"file_name": file_name})
     detected_info_collection.insert_one({"file_name": file_name, "detected_info": detected_info})
     additional_info_collection.insert_one({"file_name": file_name, "additional_info": additional_results})
 
-
+# 마스킹 데이터 가져오기
 def get_masking_data_from_mongodb(file_name):
     masking_data = set()
     detected_info = detected_info_collection.find_one({"file_name": file_name})
@@ -88,25 +91,24 @@ def get_masking_data_from_mongodb(file_name):
         for values in detected_info["detected_info"].values():
             masking_data.update(values)
 
-    # 사용자가 추가한 마스킹 정보 가져오기
     additional_info = additional_info_collection.find_one({"file_name": file_name})
     if additional_info and "additional_info" in additional_info:
         masking_data.update(additional_info["additional_info"])
 
     return masking_data
 
-# 마스킹 - 정규표현식
+# 마스킹 적용
 def apply_masking(content, masking_data):
     for item in masking_data:
         content = content.replace(item, "****")
     return content
 
-# word 문서 텍스트 추출
+# 워드 파일 텍스트 추출
 def extract_text_from_word(file_path):
     document = Document(file_path)
     return "\n".join([paragraph.text for paragraph in document.paragraphs])
 
-# excel 문서 텍스트 추출
+# 엑셀 텍스트 추출
 def extract_text_from_excel(file_path):
     workbook = load_workbook(file_path)
     text = ""
@@ -129,9 +131,12 @@ def process_xml_file(xml_path, masking_data):
     with open(xml_path, 'wb') as file:
         file.write(etree.tostring(xml_tree, pretty_print=True))
 
-# 워드 파일 마스킹
+# Word 파일 마스킹
 def mask_sensitive_data_with_images(file_path):
-    masking_data = get_masking_data_from_mongodb(file_path) # 몽고db에서 가져옴
+    masking_data = get_masking_data_from_mongodb(file_path)
+    if not masking_data:
+        print("No data to mask")
+        return None
 
     with TemporaryDirectory() as temp_dir:
         with zipfile.ZipFile(file_path, 'r') as zip_ref:
@@ -141,56 +146,47 @@ def mask_sensitive_data_with_images(file_path):
         if os.path.exists(document_xml_path):
             process_xml_file(document_xml_path, masking_data)
 
-        new_file_path = file_path.replace(".docx", "(masked).docx")
-        with zipfile.ZipFile(new_file_path, 'w') as zip_out:
+        file_name = os.path.basename(file_path).replace(".docx", "(masked).docx")
+        masked_file_path = os.path.join(MASKED_DIR, file_name)
+        with zipfile.ZipFile(masked_file_path, 'w') as zip_out:
             for foldername, subfolders, filenames in os.walk(temp_dir):
                 for filename in filenames:
                     file_path = os.path.join(foldername, filename)
                     arcname = os.path.relpath(file_path, temp_dir)
                     zip_out.write(file_path, arcname)
 
-    return new_file_path
+    return masked_file_path if os.path.exists(masked_file_path) else None
 
-# 메인 실행
-def main(file_path, file_type, additional_info_json):
+# main
+def main(file_path, file_type, selected_types_json, additional_info_json):
+    selected_types = json.loads(selected_types_json) if selected_types_json else []
     additional_info = json.loads(additional_info_json) if additional_info_json else []
-    print(f"📂 Processing file: {file_path}")
-    print(f"📄 File type: {file_type}")
-    print(f"🔍 Additional masking info: {additional_info}")
+    
+
     if file_type == "word":
         content = extract_text_from_word(file_path)
     elif file_type == "excel":
         content = extract_text_from_excel(file_path)
     else:
         print("지원하지 않는 파일 형식입니다.")
-        return
+        return None
 
-    regex_results = detect_pii_with_regex(content)
-    chatgpt_response = detect_sensitive_info_with_chatgpt(content, additional_info)
+    regex_results = detect_pii_with_regex(content, selected_types)
+    chatgpt_response = detect_sensitive_info_with_chatgpt(content, selected_types, additional_info)
 
     if "error" in chatgpt_response:
         print("ChatGPT 탐지 중 오류 발생:", chatgpt_response["error"])
-        return
+        return None
 
-    chatgpt_results = chatgpt_response.get("개인정보", {})
-    additional_results = chatgpt_response.get("추가 탐지 정보", {})
+    final_results = {**regex_results, **chatgpt_response.get("개인정보", {})}
 
-    final_results = {**regex_results, **chatgpt_results} # 키, 밸류 값 모두 넣기
-
-    save_to_mongodb(file_path, final_results, additional_results)
+    save_to_mongodb(file_path, final_results, chatgpt_response.get("추가 탐지 정보", {}))
 
     masked_file = mask_sensitive_data_with_images(file_path)
 
-    print(f"마스킹된 파일이 저장되었습니다: {masked_file}")
+    if not masked_file or not os.path.exists(masked_file):
+        print("마스킹된 파일이 생성되지 않았습니다.")
+        return None  
 
-# 프로그램 시작 시 실행
-if __name__ == "__main__":
-    import sys
-    file_path = sys.argv[1]
-    file_type = sys.argv[2]
-    additional_info_json = sys.argv[3] if len(sys.argv) > 3 else "[]"
-    
-    # json 문자열을 리스트로 변환
-    additional_info = json.loads(additional_info_json)
-    
-    main(file_path, file_type, additional_info)
+    print(f"마스킹된 파일이 저장되었습니다: {masked_file}")
+    return masked_file  # 파일 경로 반환
