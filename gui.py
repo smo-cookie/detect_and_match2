@@ -1,15 +1,19 @@
 import os
-import shutil
-import subprocess
-import sys
 import json
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from ttkbootstrap import Style
+from masking_main import main as masking_main_function  # 직접 import로 변경 -> 서비스 연결
 
+# 업로드 및 마스킹 파일 저장 폴더 설정
 UPLOAD_DIR = "uploads"
+MASKED_DIR = "masked_files"
+
 if not os.path.exists(UPLOAD_DIR):
     os.makedirs(UPLOAD_DIR)
+
+if not os.path.exists(MASKED_DIR):
+    os.makedirs(MASKED_DIR)
 
 class SMOCookieApp:
     def __init__(self):
@@ -19,9 +23,7 @@ class SMOCookieApp:
         self.root.geometry("800x600")
 
         self.selected_file = None
-        self.masking_options = [
-            "주민등록번호", "주소", "연락처", "생년월일", "계좌번호", "여권번호", "이메일", "카드번호", "성명"
-        ]
+        self.masking_options = ["주민등록번호", "주소", "연락처", "생년월일", "계좌번호", "여권번호", "이메일", "카드번호", "성명"]
         self.selected_options = {}
 
         self.create_main_ui()
@@ -57,18 +59,13 @@ class SMOCookieApp:
         action_frame = tk.Frame(self.root)
         action_frame.pack(pady=20)
         
-        self.create_button(action_frame, "Upload", self.upload_file, 0, "darkgoldenrod")
         self.create_button(action_frame, "Mask", self.start_masking, 1, "darkgoldenrod")
-
 
     def create_button(self, parent, text, command, column, color=None):
         button = tk.Button(parent, text=text, command=command, font=("Arial", 10))
-    
         if color:
             button.config(fg="white", bg=color)  
-    
         button.grid(row=0, column=column, padx=5, pady=5)
-
 
     def select_file(self):
         file_path = filedialog.askopenfilename(filetypes=[("Word and Excel files", "*.docx *.xlsx")])
@@ -81,12 +78,10 @@ class SMOCookieApp:
             messagebox.showwarning("Warning", "No file selected to open.")
             return
         try:
-            if sys.platform == "win32":
+            if os.name == "nt":  # Windows
                 os.startfile(self.selected_file)
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", self.selected_file])
-            else:
-                subprocess.Popen(["xdg-open", self.selected_file])
+            elif os.name == "posix":  # macOS, Linux
+                os.system(f'open "{self.selected_file}"' if sys.platform == "darwin" else f'xdg-open "{self.selected_file}"')
         except Exception as e:
             messagebox.showerror("Error", f"Could not open file: {e}")
 
@@ -98,18 +93,6 @@ class SMOCookieApp:
         else:
             messagebox.showwarning("Warning", "No file selected to delete.")
 
-    def upload_file(self):
-        if not self.selected_file:
-            messagebox.showerror("Error", "No file selected for upload.")
-            return
-        
-        dest_path = os.path.join(UPLOAD_DIR, os.path.basename(self.selected_file))
-        try:
-            shutil.copy(self.selected_file, dest_path)
-            messagebox.showinfo("Success", f"File uploaded to {dest_path}")
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to upload file: {e}")
-
     def start_masking(self):
         if not self.selected_file:
             messagebox.showerror("Error", "No file selected for masking.")
@@ -119,20 +102,28 @@ class SMOCookieApp:
         additional_data = self.additional_info.get().split(',') if self.additional_info.get() else []
 
         try:
-            result = subprocess.run(
-                ["python", "masking_main.py", self.selected_file, "word" if self.selected_file.endswith(".docx") else "excel", json.dumps(additional_data)],
-                capture_output=True,
-                text=True
+            # masking_main의 main 함수 호출
+            masked_file = masking_main_function(
+                self.selected_file,
+                "word" if self.selected_file.endswith(".docx") else "excel",
+                json.dumps(selected_types),
+                json.dumps(additional_data)
             )
             
-            if result.returncode == 0:
-                messagebox.showinfo("Success", "Masking completed successfully!")
-            else:
-                messagebox.showerror("Error", f"Masking failed: {result.stderr}")
+            if not masked_file or not os.path.exists(masked_file):
+                messagebox.showerror("Error", "Masking failed. No masked file generated")
+                return
+
+            messagebox.showinfo("Success", f"Masking completed successfully!\nDownload from:\n{masked_file}")
+            
+            # 마스킹된 파일 자동 다운로드 (Windows/macOS/Linux 지원) // 폐기
+            # if os.name == "nt":
+            #     os.startfile(masked_file)
+            # elif os.name == "posix":
+            #     os.system(f'open "{masked_file}"' if sys.platform == "darwin" else f'xdg-open "{masked_file}"')
 
         except Exception as e:
             messagebox.showerror("Error", f"Failed to execute masking: {e}")
-
 
 if __name__ == "__main__":
     app = SMOCookieApp()
